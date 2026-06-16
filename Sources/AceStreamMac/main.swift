@@ -634,24 +634,34 @@ private final class HLSFileServer {
         }
 
         let responseBody = method == "HEAD" ? Data() : body
-        send(status: "200 OK", body: responseBody, contentType: contentType(for: fileURL), contentLength: body.count, on: connection)
+        let shouldSendLength = fileURL.pathExtension.lowercased() != "m3u8" || method == "HEAD"
+        send(
+            status: "200 OK",
+            body: responseBody,
+            contentType: contentType(for: fileURL),
+            contentLength: shouldSendLength ? body.count : nil,
+            on: connection
+        )
     }
 
     private func send(status: String, body: Data, contentType: String, contentLength: Int? = nil, on connection: NWConnection) {
-        let length = contentLength ?? body.count
-        let headers = """
+        var headers = """
         HTTP/1.1 \(status)\r
         Content-Type: \(contentType)\r
-        Content-Length: \(length)\r
         Cache-Control: no-cache\r
         Access-Control-Allow-Origin: *\r
         Connection: close\r
-        \r
         """
+
+        if let contentLength {
+            headers += "Content-Length: \(contentLength)\r\n"
+        }
+
+        headers += "\r\n"
 
         var response = Data(headers.utf8)
         response.append(body)
-        connection.send(content: response, completion: .contentProcessed { _ in
+        connection.send(content: response, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
