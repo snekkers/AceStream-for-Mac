@@ -42,6 +42,7 @@ final class AppState: ObservableObject {
     @Published var engineAddress = UserDefaults.standard.string(forKey: "engineAddress") ?? "http://127.0.0.1:6878"
     @Published var status = "Введите acestream:// ссылку или content id."
     @Published var isPlaying = false
+    @Published var isLoading = false
 
     let player = AVPlayer()
 
@@ -54,9 +55,46 @@ final class AppState: ObservableObject {
 
         UserDefaults.standard.set(engineAddress, forKey: "engineAddress")
 
-        guard let playbackURL = makePlaybackURL(from: source) else {
+        guard let resolved = makePlaybackURL(from: source) else {
             status = "Не удалось распознать AceStream-ссылку или URL."
             return
+        }
+
+        Task {
+            await openResolvedURL(resolved.url, source: source, requiresEngine: resolved.requiresEngine)
+        }
+    }
+
+    func stop() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        isPlaying = false
+        isLoading = false
+        status = "Воспроизведение остановлено."
+    }
+
+    func testEngine() {
+        Task {
+            isLoading = true
+            status = "Проверяю AceStream Engine..."
+            let available = await engineIsAvailable()
+            isLoading = false
+            status = available
+                ? "AceStream Engine отвечает на \(normalizedEngineAddress)."
+                : "AceStream Engine не отвечает на \(normalizedEngineAddress). Запустите engine и попробуйте снова."
+        }
+    }
+
+    private func openResolvedURL(_ playbackURL: URL, source: String, requiresEngine: Bool) async {
+        isLoading = true
+        defer { isLoading = false }
+
+        if requiresEngine {
+            status = "Проверяю AceStream Engine..."
+            guard await engineIsAvailable() else {
+                status = "AceStream Engine не отвечает на \(normalizedEngineAddress). Ссылка не сможет запуститься без engine."
+                return
+            }
         }
 
         input = source
@@ -66,25 +104,37 @@ final class AppState: ObservableObject {
         status = "Открыто: \(playbackURL.absoluteString)"
     }
 
-    func stop() {
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        isPlaying = false
-        status = "Воспроизведение остановлено."
+    private func engineIsAvailable() async -> Bool {
+        guard let url = URL(string: normalizedEngineAddress) else { return false }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3
+        configuration.timeoutIntervalForResource = 3
+        let session = URLSession(configuration: configuration)
+
+        do {
+            _ = try await session.data(from: url)
+            return true
+        } catch {
+            return false
+        }
     }
 
-    private func makePlaybackURL(from source: String) -> URL? {
+    private var normalizedEngineAddress: String {
+        engineAddress.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    }
+
+    private func makePlaybackURL(from source: String) -> PlaybackURL? {
         if let url = URL(string: source), ["http", "https"].contains(url.scheme?.lowercased()) {
-            return url
+            return PlaybackURL(url: url, requiresEngine: false)
         }
 
         guard let contentID = extractContentID(from: source) else { return nil }
-        let normalizedEngineAddress = engineAddress.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         guard var components = URLComponents(string: "\(normalizedEngineAddress)/ace/getstream") else {
             return nil
         }
         components.queryItems = [URLQueryItem(name: "id", value: contentID)]
-        return components.url
+        guard let url = components.url else { return nil }
+        return PlaybackURL(url: url, requiresEngine: true)
     }
 
     private func extractContentID(from source: String) -> String? {
@@ -108,6 +158,11 @@ final class AppState: ObservableObject {
         }
         return String(trimmed[match]).lowercased()
     }
+}
+
+private struct PlaybackURL {
+    let url: URL
+    let requiresEngine: Bool
 }
 
 struct ContentView: View {
@@ -139,6 +194,7 @@ struct ContentView: View {
                     Label("Открыть", systemImage: "play.fill")
                 }
                 .keyboardShortcut(.return, modifiers: .command)
+                .disabled(appState.isLoading)
 
                 Button {
                     appState.stop()
@@ -155,6 +211,13 @@ struct ContentView: View {
                 TextField("http://127.0.0.1:6878", text: $appState.engineAddress)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 260)
+
+                Button {
+                    appState.testEngine()
+                } label: {
+                    Label("Проверить", systemImage: "checkmark.circle")
+                }
+                .disabled(appState.isLoading)
 
                 Spacer()
             }
