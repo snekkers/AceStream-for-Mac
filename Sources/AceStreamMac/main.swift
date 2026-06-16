@@ -101,9 +101,11 @@ final class AppState: ObservableObject {
     private let engineContainerName = "aceserve"
     private let engineImageName = "jopsis/aceserve:latest"
     private let remuxImageName = "lscr.io/linuxserver/ffmpeg:latest"
+    private let hlsStartupTimeoutSeconds = 600
     private var activeRemuxContainerName: String?
     private var activeHLSDirectory: URL?
     private var activeHLSServer: HLSFileServer?
+    private var lastRemuxFailureDetails = ""
 
     @Published var input = ""
     @Published var engineAddress = UserDefaults.standard.string(forKey: "engineAddress") ?? "http://127.0.0.1:6878"
@@ -169,16 +171,20 @@ final class AppState: ObservableObject {
                 return
             }
 
-            status = "Жду данные трансляции..."
-            guard let streamURL = await waitForStreamData(from: playbackURL) else {
+            status = "Получаю адрес видеопотока от AceStream Engine..."
+            guard let streamURL = await resolveEngineStreamURL(from: playbackURL) else {
                 return
             }
 
             status = "Готовлю поток для macOS-плеера..."
-            guard let hlsURL = await startHLSRemux(from: streamURL) else {
+            if let hlsURL = await startHLSRemux(from: streamURL) {
+                playableURL = hlsURL
+            } else if shouldRetryAfterRemuxFailure,
+                      let retryURL = await retryAfterRestartingLocalEngine(playbackURL: playbackURL) {
+                playableURL = retryURL
+            } else {
                 return
             }
-            playableURL = hlsURL
         }
 
         input = source
@@ -263,33 +269,52 @@ final class AppState: ObservableObject {
         return false
     }
 
-    private func waitForStreamData(from url: URL) async -> URL? {
+    private func resolveEngineStreamURL(from url: URL) async -> URL? {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 45
-        configuration.timeoutIntervalForResource = 45
-        let session = URLSession(configuration: configuration)
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 30
+        let redirectBlocker = RedirectBlocker()
+        let session = URLSession(configuration: configuration, delegate: redirectBlocker, delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
 
-        do {
-            let (bytes, response) = try await session.bytes(from: url)
-            if let httpResponse = response as? HTTPURLResponse,
-               !(200...299).contains(httpResponse.statusCode) {
+        var currentURL = url
+        for _ in 1...6 {
+            do {
+                let (_, response) = try await session.data(from: currentURL)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    status = "AceStream Engine вернул неожиданный ответ."
+                    return nil
+                }
+
+                if (300...399).contains(httpResponse.statusCode),
+                   let location = httpResponse.value(forHTTPHeaderField: "Location"),
+                   let nextURL = URL(string: location, relativeTo: currentURL)?.absoluteURL {
+                    currentURL = nextURL
+                    if nextURL.path.hasPrefix("/content/") {
+                        return nextURL
+                    }
+                    continue
+                }
+
+                if (200...299).contains(httpResponse.statusCode) {
+                    return currentURL
+                }
+
                 status = "AceStream Engine вернул HTTP \(httpResponse.statusCode). Проверьте ссылку."
                 return nil
+            } catch {
+                status = "AceStream Engine не отдал адрес видеопотока. Возможно, ссылка неактивна или нет peers."
+                return nil
             }
-
-            for try await _ in bytes {
-                return response.url ?? url
-            }
-
-            status = "Трансляция открылась, но не отдала видео-данные."
-            return nil
-        } catch {
-            status = "Трансляция сейчас не отдает данные. Возможно, ссылка неактивна или нет peers."
-            return nil
         }
+
+        status = "AceStream Engine вернул слишком длинную цепочку перенаправлений."
+        return nil
     }
 
     private func startHLSRemux(from streamURL: URL) async -> URL? {
+        lastRemuxFailureDetails = ""
+
         guard let dockerPath = dockerExecutablePath() else {
             status = "Docker Desktop не найден. Нужен Docker для подготовки AceStream-потока к воспроизведению."
             return nil
@@ -315,19 +340,25 @@ final class AppState: ObservableObject {
         activeHLSDirectory = hlsDirectory
 
         let result = await runCommand(dockerPath, [
-            "run", "-d", "--rm",
+            "run", "-d",
             "--name", containerName,
             "-v", "\(hlsDirectory.path):/hls",
             remuxImageName,
+            "-nostdin",
             "-hide_banner",
             "-loglevel", "warning",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-fflags", "+genpts",
             "-i", dockerInputURL.absoluteString,
             "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
             "-f", "hls",
             "-hls_time", "3",
             "-hls_list_size", "8",
             "-hls_flags", "delete_segments+append_list+omit_endlist",
+            "-hls_segment_filename", "/hls/stream%05d.ts",
             "/hls/stream.m3u8"
         ])
 
@@ -338,8 +369,12 @@ final class AppState: ObservableObject {
             return nil
         }
 
-        guard await waitForHLSPlaylist(at: playlistURL, in: hlsDirectory) else {
-            status = "ffmpeg запустился, но HLS-поток не появился. Возможно, трансляция оборвалась или формат не поддержан."
+        switch await waitForHLSPlaylist(at: playlistURL, in: hlsDirectory, dockerPath: dockerPath, containerName: containerName) {
+        case .ready:
+            break
+        case .failed(let details):
+            lastRemuxFailureDetails = details
+            status = "ffmpeg не смог подготовить HLS: \(details.trimmedForStatus)"
             await stopCurrentRemux()
             return nil
         }
@@ -356,17 +391,64 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func waitForHLSPlaylist(at playlistURL: URL, in directory: URL) async -> Bool {
-        for _ in 1...60 {
+    private var shouldRetryAfterRemuxFailure: Bool {
+        isLocalEngineAddress &&
+        lastRemuxFailureDetails.range(of: "Invalid data found when processing input", options: .caseInsensitive) != nil
+    }
+
+    private func retryAfterRestartingLocalEngine(playbackURL: URL) async -> URL? {
+        guard let dockerPath = dockerExecutablePath() else { return nil }
+
+        status = "AceStream Engine отдал некорректный поток. Перезапускаю Engine и пробую еще раз..."
+        _ = await runCommand(dockerPath, ["restart", engineContainerName])
+
+        status = "Жду AceStream Engine после перезапуска..."
+        guard await waitForEngine() else {
+            status = "AceStream Engine не ответил после перезапуска."
+            return nil
+        }
+
+        status = "Повторно получаю адрес видеопотока..."
+        guard let streamURL = await resolveEngineStreamURL(from: playbackURL) else {
+            return nil
+        }
+
+        status = "Повторно готовлю поток для macOS-плеера..."
+        return await startHLSRemux(from: streamURL)
+    }
+
+    private func waitForHLSPlaylist(at playlistURL: URL, in directory: URL, dockerPath: String, containerName: String) async -> RemuxWaitResult {
+        for second in 1...hlsStartupTimeoutSeconds {
             if FileManager.default.fileExists(atPath: playlistURL.path),
                let contents = try? String(contentsOf: playlistURL, encoding: .utf8),
                contents.contains("#EXTINF"),
                hlsDirectoryHasSegments(directory) {
-                return true
+                return .ready
             }
+
+            let inspect = await runCommand(dockerPath, ["inspect", "-f", "{{.State.Running}}", containerName])
+            if inspect.exitCode != 0 {
+                return .failed(inspect.output)
+            }
+
+            if inspect.output.trimmingCharacters(in: .whitespacesAndNewlines) != "true" {
+                return .failed(await remuxLogs(dockerPath: dockerPath, containerName: containerName))
+            }
+
+            if second == 15 || (second > 0 && second % 30 == 0) {
+                status = "Жду первые HLS-сегменты... ffmpeg работает, поток еще прогревается (\(second) сек.)."
+            }
+
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
-        return false
+
+        let logs = await remuxLogs(dockerPath: dockerPath, containerName: containerName)
+        return .failed(logs.isEmpty ? "HLS-плейлист не появился за \(hlsStartupTimeoutSeconds) секунд." : logs)
+    }
+
+    private func remuxLogs(dockerPath: String, containerName: String) async -> String {
+        let result = await runCommand(dockerPath, ["logs", "--tail", "40", containerName])
+        return result.output
     }
 
     private func hlsDirectoryHasSegments(_ directory: URL) -> Bool {
@@ -410,6 +492,7 @@ final class AppState: ObservableObject {
         if let containerName,
            let dockerPath = dockerExecutablePath() {
             _ = await runCommand(dockerPath, ["stop", containerName])
+            _ = await runCommand(dockerPath, ["rm", "-f", containerName])
         }
 
         if let hlsDirectory {
@@ -552,6 +635,23 @@ private struct CommandResult {
     let output: String
 }
 
+private enum RemuxWaitResult {
+    case ready
+    case failed(String)
+}
+
+private final class RedirectBlocker: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 private final class HLSFileServer {
     private let directory: URL
     private let queue = DispatchQueue(label: "local.hls.server")
@@ -634,30 +734,29 @@ private final class HLSFileServer {
         }
 
         let responseBody = method == "HEAD" ? Data() : body
-        let shouldSendLength = fileURL.pathExtension.lowercased() != "m3u8" || method == "HEAD"
         send(
             status: "200 OK",
             body: responseBody,
             contentType: contentType(for: fileURL),
-            contentLength: shouldSendLength ? body.count : nil,
+            contentLength: body.count,
             on: connection
         )
     }
 
     private func send(status: String, body: Data, contentType: String, contentLength: Int? = nil, on connection: NWConnection) {
-        var headers = """
-        HTTP/1.1 \(status)\r
-        Content-Type: \(contentType)\r
-        Cache-Control: no-cache\r
-        Access-Control-Allow-Origin: *\r
-        Connection: close\r
-        """
+        var headerLines = [
+            "HTTP/1.1 \(status)",
+            "Content-Type: \(contentType)",
+            "Cache-Control: no-cache",
+            "Access-Control-Allow-Origin: *",
+            "Connection: close"
+        ]
 
         if let contentLength {
-            headers += "Content-Length: \(contentLength)\r\n"
+            headerLines.append("Content-Length: \(contentLength)")
         }
 
-        headers += "\r\n"
+        let headers = headerLines.joined(separator: "\r\n") + "\r\n\r\n"
 
         var response = Data(headers.utf8)
         response.append(body)
