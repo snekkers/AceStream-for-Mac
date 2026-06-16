@@ -14,6 +14,9 @@ struct AceStreamMacApp: App {
                 .frame(minWidth: 860, minHeight: 560)
                 .onAppear {
                     appDelegate.appState = appState
+                    DispatchQueue.main.async {
+                        appDelegate.playerWindowAppeared()
+                    }
                 }
         }
         .commands {
@@ -25,15 +28,70 @@ struct AceStreamMacApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var appState: AppState?
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidBecomeMain),
+            name: NSWindow.didBecomeMainNotification,
+            object: nil
+        )
+
+        DispatchQueue.main.async {
+            self.focusSinglePlayerWindow()
+        }
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
         DispatchQueue.main.async {
             self.appState?.open(url.absoluteString)
+            self.focusSinglePlayerWindow()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        focusSinglePlayerWindow()
+        return false
+    }
+
+    func playerWindowAppeared() {
+        focusSinglePlayerWindow()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    @objc private func windowDidBecomeMain(_ notification: Notification) {
+        DispatchQueue.main.async {
+            self.keepOnlyOnePlayerWindow()
+        }
+    }
+
+    private func focusSinglePlayerWindow() {
+        keepOnlyOnePlayerWindow()
+        if let window = playerWindows.first {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    private func keepOnlyOnePlayerWindow() {
+        let windows = playerWindows
+        guard windows.count > 1 else { return }
+
+        let windowToKeep = windows.first { $0.isKeyWindow } ?? windows.first { $0.isMainWindow } ?? windows[0]
+        for window in windows where window !== windowToKeep {
+            window.close()
+        }
+    }
+
+    private var playerWindows: [NSWindow] {
+        NSApp.orderedWindows.filter { window in
+            window.canBecomeMain &&
+            !window.isSheet &&
+            window.contentView != nil
+        }
     }
 }
 
