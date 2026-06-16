@@ -99,6 +99,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class AppState: ObservableObject {
     private let engineContainerName = "aceserve"
     private let engineImageName = "jopsis/aceserve:latest"
+    private let remuxImageName = "lscr.io/linuxserver/ffmpeg:latest"
+    private var activeRemuxContainerName: String?
+    private var activeHLSDirectory: URL?
 
     @Published var input = ""
     @Published var engineAddress = UserDefaults.standard.string(forKey: "engineAddress") ?? "http://127.0.0.1:6878"
@@ -133,6 +136,10 @@ final class AppState: ObservableObject {
         isPlaying = false
         isLoading = false
         status = "Воспроизведение остановлено."
+
+        Task {
+            await stopCurrentRemux()
+        }
     }
 
     func testEngine() {
@@ -151,6 +158,8 @@ final class AppState: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        await stopCurrentRemux()
+
         var playableURL = playbackURL
         if requiresEngine {
             status = "Проверяю AceStream Engine..."
@@ -162,7 +171,12 @@ final class AppState: ObservableObject {
             guard let streamURL = await waitForStreamData(from: playbackURL) else {
                 return
             }
-            playableURL = streamURL
+
+            status = "Готовлю поток для macOS-плеера..."
+            guard let hlsURL = await startHLSRemux(from: streamURL) else {
+                return
+            }
+            playableURL = hlsURL
         }
 
         input = source
@@ -270,6 +284,121 @@ final class AppState: ObservableObject {
         } catch {
             status = "Трансляция сейчас не отдает данные. Возможно, ссылка неактивна или нет peers."
             return nil
+        }
+    }
+
+    private func startHLSRemux(from streamURL: URL) async -> URL? {
+        guard let dockerPath = dockerExecutablePath() else {
+            status = "Docker Desktop не найден. Нужен Docker для подготовки AceStream-потока к воспроизведению."
+            return nil
+        }
+
+        let containerName = "acestream-remux-\(UUID().uuidString.lowercased())"
+        let hlsDirectory = URL(fileURLWithPath: "/tmp/AceStreamMac/HLS/\(UUID().uuidString)", isDirectory: true)
+        let playlistURL = hlsDirectory.appendingPathComponent("stream.m3u8")
+
+        do {
+            try FileManager.default.createDirectory(at: hlsDirectory, withIntermediateDirectories: true)
+        } catch {
+            status = "Не удалось создать папку HLS: \(error.localizedDescription)"
+            return nil
+        }
+
+        guard let dockerInputURL = dockerReachableURL(from: streamURL) else {
+            status = "Не удалось подготовить URL потока для Docker."
+            return nil
+        }
+
+        activeRemuxContainerName = containerName
+        activeHLSDirectory = hlsDirectory
+
+        let result = await runCommand(dockerPath, [
+            "run", "-d", "--rm",
+            "--name", containerName,
+            "-v", "\(hlsDirectory.path):/hls",
+            remuxImageName,
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-fflags", "+genpts",
+            "-i", dockerInputURL.absoluteString,
+            "-c", "copy",
+            "-f", "hls",
+            "-hls_time", "3",
+            "-hls_list_size", "8",
+            "-hls_flags", "delete_segments+append_list+omit_endlist",
+            "/hls/stream.m3u8"
+        ])
+
+        if result.exitCode != 0 {
+            status = "Не удалось запустить ffmpeg для HLS: \(result.output.trimmedForStatus)"
+            activeRemuxContainerName = nil
+            activeHLSDirectory = nil
+            return nil
+        }
+
+        guard await waitForHLSPlaylist(at: playlistURL, in: hlsDirectory) else {
+            status = "ffmpeg запустился, но HLS-поток не появился. Возможно, трансляция оборвалась или формат не поддержан."
+            await stopCurrentRemux()
+            return nil
+        }
+
+        return playlistURL
+    }
+
+    private func waitForHLSPlaylist(at playlistURL: URL, in directory: URL) async -> Bool {
+        for _ in 1...60 {
+            if FileManager.default.fileExists(atPath: playlistURL.path),
+               let contents = try? String(contentsOf: playlistURL, encoding: .utf8),
+               contents.contains("#EXTINF"),
+               hlsDirectoryHasSegments(directory) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
+    private func hlsDirectoryHasSegments(_ directory: URL) -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return false
+        }
+
+        return files.contains { file in
+            guard file.pathExtension == "ts",
+                  let values = try? file.resourceValues(forKeys: [.fileSizeKey]),
+                  let fileSize = values.fileSize else {
+                return false
+            }
+            return fileSize > 0
+        }
+    }
+
+    private func dockerReachableURL(from url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        if let host = components.host?.lowercased(),
+           ["127.0.0.1", "localhost", "::1"].contains(host) {
+            components.host = "host.docker.internal"
+        }
+
+        return components.url
+    }
+
+    private func stopCurrentRemux() async {
+        let containerName = activeRemuxContainerName
+        let hlsDirectory = activeHLSDirectory
+        activeRemuxContainerName = nil
+        activeHLSDirectory = nil
+
+        if let containerName,
+           let dockerPath = dockerExecutablePath() {
+            _ = await runCommand(dockerPath, ["stop", containerName])
+        }
+
+        if let hlsDirectory {
+            try? FileManager.default.removeItem(at: hlsDirectory)
         }
     }
 
