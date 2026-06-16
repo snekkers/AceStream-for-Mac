@@ -38,10 +38,22 @@ xcode-select --install
 build/AceStream Mac Player.app
 ```
 
+## Быстрый запуск
+
+1. Установите Docker Desktop для Mac: https://www.docker.com/products/docker-desktop/
+2. Запустите Docker Desktop и дождитесь, пока он полностью стартует.
+3. В терминале из папки проекта выполните:
+
+```bash
+./scripts/run-player.sh
+```
+
+Скрипт запустит AceStream Engine в Docker, соберет приложение при необходимости и откроет плеер.
+
 ## Использование
 
-1. Запустите AceStream Engine так, чтобы он слушал `http://127.0.0.1:6878`.
-2. Откройте `build/AceStream Mac Player.app`.
+1. Запустите Docker Desktop.
+2. Запустите плеер командой `./scripts/run-player.sh`.
 3. Вставьте `acestream://...`, 40-символьный content id или прямой `http(s)` URL.
 4. Нажмите `Открыть`.
 
