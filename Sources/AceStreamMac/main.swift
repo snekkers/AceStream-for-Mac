@@ -1,4 +1,5 @@
 import AVKit
+import Foundation
 import SwiftUI
 
 @main
@@ -38,6 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @MainActor
 final class AppState: ObservableObject {
+    private let engineContainerName = "aceserve"
+    private let engineImageName = "jopsis/aceserve:latest"
+
     @Published var input = ""
     @Published var engineAddress = UserDefaults.standard.string(forKey: "engineAddress") ?? "http://127.0.0.1:6878"
     @Published var status = "Введите acestream:// ссылку или content id."
@@ -76,12 +80,12 @@ final class AppState: ObservableObject {
     func testEngine() {
         Task {
             isLoading = true
-            status = "Проверяю AceStream Engine..."
-            let available = await engineIsAvailable()
+            status = "Проверяю и запускаю AceStream Engine..."
+            let available = await ensureEngineIsRunning()
             isLoading = false
             status = available
                 ? "AceStream Engine отвечает на \(normalizedEngineAddress)."
-                : "AceStream Engine не отвечает на \(normalizedEngineAddress). Запустите engine и попробуйте снова."
+                : status
         }
     }
 
@@ -91,8 +95,7 @@ final class AppState: ObservableObject {
 
         if requiresEngine {
             status = "Проверяю AceStream Engine..."
-            guard await engineIsAvailable() else {
-                status = "AceStream Engine не отвечает на \(normalizedEngineAddress). Ссылка не сможет запуститься без engine."
+            guard await ensureEngineIsRunning() else {
                 return
             }
         }
@@ -102,6 +105,45 @@ final class AppState: ObservableObject {
         player.play()
         isPlaying = true
         status = "Открыто: \(playbackURL.absoluteString)"
+    }
+
+    private func ensureEngineIsRunning() async -> Bool {
+        if await engineIsAvailable() {
+            return true
+        }
+
+        guard isLocalEngineAddress else {
+            status = "AceStream Engine не отвечает на \(normalizedEngineAddress). Автозапуск доступен только для локального Engine."
+            return false
+        }
+
+        guard let dockerPath = dockerExecutablePath() else {
+            status = "Docker Desktop не найден. Установите Docker Desktop для Mac, запустите его и попробуйте снова."
+            return false
+        }
+
+        status = "AceStream Engine не запущен. Проверяю Docker Desktop..."
+        if !(await dockerIsRunning(dockerPath: dockerPath)) {
+            status = "Запускаю Docker Desktop..."
+            _ = await runCommand("/usr/bin/open", ["-a", "Docker"])
+            guard await waitForDocker(dockerPath: dockerPath) else {
+                status = "Docker Desktop не запустился. Откройте Docker Desktop вручную и дождитесь статуса Docker is running."
+                return false
+            }
+        }
+
+        status = "Запускаю AceStream Engine..."
+        guard await startEngineContainer(dockerPath: dockerPath) else {
+            return false
+        }
+
+        status = "Жду AceStream Engine на \(normalizedEngineAddress)..."
+        guard await waitForEngine() else {
+            status = "Контейнер запущен, но Engine пока не ответил на \(normalizedEngineAddress). Попробуйте еще раз через несколько секунд."
+            return false
+        }
+
+        return true
     }
 
     private func engineIsAvailable() async -> Bool {
@@ -121,6 +163,111 @@ final class AppState: ObservableObject {
 
     private var normalizedEngineAddress: String {
         engineAddress.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    }
+
+    private var isLocalEngineAddress: Bool {
+        guard let host = URL(string: normalizedEngineAddress)?.host?.lowercased() else {
+            return false
+        }
+        return ["127.0.0.1", "localhost", "::1"].contains(host)
+    }
+
+    private func waitForEngine() async -> Bool {
+        for _ in 1...60 {
+            if await engineIsAvailable() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
+    private func dockerExecutablePath() -> String? {
+        let homeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "/opt/homebrew/bin/docker",
+            "/usr/local/bin/docker",
+            "\(homeDirectory)/.docker/bin/docker",
+            "/Applications/Docker.app/Contents/Resources/bin/docker"
+        ]
+
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func dockerIsRunning(dockerPath: String) async -> Bool {
+        let result = await runCommand(dockerPath, ["info"])
+        return result.exitCode == 0
+    }
+
+    private func waitForDocker(dockerPath: String) async -> Bool {
+        for _ in 1...90 {
+            if await dockerIsRunning(dockerPath: dockerPath) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        return false
+    }
+
+    private func startEngineContainer(dockerPath: String) async -> Bool {
+        let runningContainers = await runCommand(dockerPath, ["ps", "--format", "{{.Names}}"])
+        if runningContainers.output.lines.contains(engineContainerName) {
+            return true
+        }
+
+        let allContainers = await runCommand(dockerPath, ["ps", "-a", "--format", "{{.Names}}"])
+        if allContainers.output.lines.contains(engineContainerName) {
+            let startResult = await runCommand(dockerPath, ["start", engineContainerName])
+            if startResult.exitCode != 0 {
+                status = "Не удалось запустить контейнер \(engineContainerName): \(startResult.output.trimmedForStatus)"
+                return false
+            }
+            return true
+        }
+
+        status = "Скачиваю и запускаю AceStream Engine. Первый запуск может занять несколько минут..."
+        let runResult = await runCommand(dockerPath, [
+            "run", "-d",
+            "--name", engineContainerName,
+            "--restart", "unless-stopped",
+            "-p", "6878:6878",
+            "-p", "8621:8621",
+            "-p", "62062:62062",
+            engineImageName
+        ])
+
+        if runResult.exitCode != 0 {
+            status = "Не удалось запустить AceStream Engine: \(runResult.output.trimmedForStatus)"
+            return false
+        }
+
+        return true
+    }
+
+    private func runCommand(_ executablePath: String, _ arguments: [String]) async -> CommandResult {
+        await Task.detached(priority: .utility) {
+            let process = Process()
+            let pipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
+            process.standardOutput = pipe
+            process.standardError = pipe
+            process.environment = [
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+            ]
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
+                return CommandResult(exitCode: process.terminationStatus, output: output)
+            } catch {
+                return CommandResult(exitCode: 127, output: error.localizedDescription)
+            }
+        }.value
     }
 
     private func makePlaybackURL(from source: String) -> PlaybackURL? {
@@ -163,6 +310,22 @@ final class AppState: ObservableObject {
 private struct PlaybackURL {
     let url: URL
     let requiresEngine: Bool
+}
+
+private struct CommandResult {
+    let exitCode: Int32
+    let output: String
+}
+
+private extension String {
+    var lines: [String] {
+        split(whereSeparator: \.isNewline).map(String.init)
+    }
+
+    var trimmedForStatus: String {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "нет деталей ошибки" : trimmed
+    }
 }
 
 struct ContentView: View {
@@ -215,7 +378,7 @@ struct ContentView: View {
                 Button {
                     appState.testEngine()
                 } label: {
-                    Label("Проверить", systemImage: "checkmark.circle")
+                    Label("Запустить Engine", systemImage: "power")
                 }
                 .disabled(appState.isLoading)
 
@@ -237,7 +400,7 @@ struct ContentView: View {
                         .font(.system(size: 46, weight: .regular))
                     Text("AceStream Mac Player")
                         .font(.title2.weight(.semibold))
-                    Text("Вставьте ссылку и запустите локальный AceStream Engine.")
+                    Text("Вставьте ссылку. Engine запустится автоматически через Docker Desktop.")
                         .foregroundStyle(.secondary)
                 }
                 .foregroundStyle(.white)

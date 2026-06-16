@@ -41,8 +41,12 @@ build/AceStream Mac Player.app
 ## Быстрый запуск
 
 1. Установите Docker Desktop для Mac: https://www.docker.com/products/docker-desktop/
-2. Запустите Docker Desktop и дождитесь, пока он полностью стартует.
-3. В терминале из папки проекта выполните:
+2. Откройте `build/AceStream Mac Player.app`.
+3. Вставьте `acestream://...` ссылку и нажмите `Открыть`.
+
+Приложение само попробует запустить Docker Desktop и контейнер AceStream Engine. Первый запуск может занять несколько минут, потому что Docker скачает образ `jopsis/aceserve`.
+
+Если хотите запустить все из терминала:
 
 ```bash
 ./scripts/run-player.sh
@@ -52,8 +56,8 @@ build/AceStream Mac Player.app
 
 ## Использование
 
-1. Запустите Docker Desktop.
-2. Запустите плеер командой `./scripts/run-player.sh`.
+1. Откройте `build/AceStream Mac Player.app`.
+2. При необходимости нажмите `Запустить Engine`, или просто вставьте ссылку и нажмите `Открыть`.
 3. Вставьте `acestream://...`, 40-символьный content id или прямой `http(s)` URL.
 4. Нажмите `Открыть`.
 
