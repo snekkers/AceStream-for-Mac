@@ -93,18 +93,25 @@ final class AppState: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        var playableURL = playbackURL
         if requiresEngine {
             status = "Проверяю AceStream Engine..."
             guard await ensureEngineIsRunning() else {
                 return
             }
+
+            status = "Жду данные трансляции..."
+            guard let streamURL = await waitForStreamData(from: playbackURL) else {
+                return
+            }
+            playableURL = streamURL
         }
 
         input = source
-        player.replaceCurrentItem(with: AVPlayerItem(url: playbackURL))
+        player.replaceCurrentItem(with: AVPlayerItem(url: playableURL))
         player.play()
         isPlaying = true
-        status = "Открыто: \(playbackURL.absoluteString)"
+        status = "Открыто: \(playableURL.absoluteString)"
     }
 
     private func ensureEngineIsRunning() async -> Bool {
@@ -180,6 +187,32 @@ final class AppState: ObservableObject {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         return false
+    }
+
+    private func waitForStreamData(from url: URL) async -> URL? {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 45
+        configuration.timeoutIntervalForResource = 45
+        let session = URLSession(configuration: configuration)
+
+        do {
+            let (bytes, response) = try await session.bytes(from: url)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200...299).contains(httpResponse.statusCode) {
+                status = "AceStream Engine вернул HTTP \(httpResponse.statusCode). Проверьте ссылку."
+                return nil
+            }
+
+            for try await _ in bytes {
+                return response.url ?? url
+            }
+
+            status = "Трансляция открылась, но не отдала видео-данные."
+            return nil
+        } catch {
+            status = "Трансляция сейчас не отдает данные. Возможно, ссылка неактивна или нет peers."
+            return nil
+        }
     }
 
     private func dockerExecutablePath() -> String? {
