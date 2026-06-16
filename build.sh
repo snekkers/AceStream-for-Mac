@@ -19,7 +19,8 @@ swiftc \
   -framework SwiftUI \
   -framework AVKit \
   -framework AVFoundation \
-  -framework AppKit
+  -framework AppKit \
+  -framework Network
 
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod +x "$MACOS_DIR/AceStreamMac"

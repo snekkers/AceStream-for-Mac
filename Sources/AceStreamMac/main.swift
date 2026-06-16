@@ -1,5 +1,6 @@
 import AVKit
 import Foundation
+import Network
 import SwiftUI
 
 @main
@@ -102,6 +103,7 @@ final class AppState: ObservableObject {
     private let remuxImageName = "lscr.io/linuxserver/ffmpeg:latest"
     private var activeRemuxContainerName: String?
     private var activeHLSDirectory: URL?
+    private var activeHLSServer: HLSFileServer?
 
     @Published var input = ""
     @Published var engineAddress = UserDefaults.standard.string(forKey: "engineAddress") ?? "http://127.0.0.1:6878"
@@ -342,7 +344,16 @@ final class AppState: ObservableObject {
             return nil
         }
 
-        return playlistURL
+        do {
+            let server = HLSFileServer(directory: hlsDirectory)
+            let httpURL = try await server.start()
+            activeHLSServer = server
+            return httpURL
+        } catch {
+            status = "Не удалось запустить локальный HLS-сервер: \(error.localizedDescription)"
+            await stopCurrentRemux()
+            return nil
+        }
     }
 
     private func waitForHLSPlaylist(at playlistURL: URL, in directory: URL) async -> Bool {
@@ -389,8 +400,12 @@ final class AppState: ObservableObject {
     private func stopCurrentRemux() async {
         let containerName = activeRemuxContainerName
         let hlsDirectory = activeHLSDirectory
+        let hlsServer = activeHLSServer
         activeRemuxContainerName = nil
         activeHLSDirectory = nil
+        activeHLSServer = nil
+
+        hlsServer?.stop()
 
         if let containerName,
            let dockerPath = dockerExecutablePath() {
@@ -535,6 +550,138 @@ private struct PlaybackURL {
 private struct CommandResult {
     let exitCode: Int32
     let output: String
+}
+
+private final class HLSFileServer {
+    private let directory: URL
+    private let queue = DispatchQueue(label: "local.hls.server")
+    private var listener: NWListener?
+
+    init(directory: URL) {
+        self.directory = directory.standardizedFileURL
+    }
+
+    func start() async throws -> URL {
+        let listener = try NWListener(using: .tcp, on: 0)
+        self.listener = listener
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let resumeState = OneShotResume()
+
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.handle(connection)
+            }
+
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    resumeState.resume {
+                        let port = listener.port?.rawValue ?? 0
+                        continuation.resume(returning: URL(string: "http://127.0.0.1:\(port)/stream.m3u8")!)
+                    }
+                case .failed(let error):
+                    resumeState.resume {
+                        continuation.resume(throwing: error)
+                    }
+                default:
+                    break
+                }
+            }
+
+            listener.start(queue: queue)
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
+            guard let self, let data, let request = String(data: data, encoding: .utf8) else {
+                connection.cancel()
+                return
+            }
+
+            self.respond(to: request, on: connection)
+        }
+    }
+
+    private func respond(to request: String, on connection: NWConnection) {
+        let firstLine = request.components(separatedBy: "\r\n").first ?? ""
+        let parts = firstLine.split(separator: " ")
+        guard parts.count >= 2 else {
+            send(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
+        let method = String(parts[0])
+        guard method == "GET" || method == "HEAD" else {
+            send(status: "405 Method Not Allowed", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
+        let rawPath = String(parts[1]).components(separatedBy: "?").first ?? "/"
+        let requestedName = rawPath == "/" ? "stream.m3u8" : String(rawPath.dropFirst()).removingPercentEncoding ?? ""
+        let fileURL = directory.appendingPathComponent(requestedName).standardizedFileURL
+
+        guard fileURL.path.hasPrefix(directory.path + "/"),
+              let body = try? Data(contentsOf: fileURL) else {
+            send(status: "404 Not Found", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
+        let responseBody = method == "HEAD" ? Data() : body
+        send(status: "200 OK", body: responseBody, contentType: contentType(for: fileURL), contentLength: body.count, on: connection)
+    }
+
+    private func send(status: String, body: Data, contentType: String, contentLength: Int? = nil, on connection: NWConnection) {
+        let length = contentLength ?? body.count
+        let headers = """
+        HTTP/1.1 \(status)\r
+        Content-Type: \(contentType)\r
+        Content-Length: \(length)\r
+        Cache-Control: no-cache\r
+        Access-Control-Allow-Origin: *\r
+        Connection: close\r
+        \r
+        """
+
+        var response = Data(headers.utf8)
+        response.append(body)
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private func contentType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "m3u8":
+            return "application/vnd.apple.mpegurl"
+        case "ts":
+            return "video/mp2t"
+        default:
+            return "application/octet-stream"
+        }
+    }
+}
+
+private final class OneShotResume: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+
+    func resume(_ block: () -> Void) {
+        lock.lock()
+        if didResume {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+        block()
+    }
 }
 
 private extension String {
